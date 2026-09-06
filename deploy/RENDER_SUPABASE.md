@@ -59,7 +59,9 @@ git push -u origin main
    Open it and log in with the `ADMIN_USER`/`ADMIN_PASSWORD` you set.
 
 (If you'd rather not use the Blueprint: New → Web Service → connect the repo →
-set Build Command `npm install && npm run build && npm run migrate && npm run setup`,
+set Build Command `npm install --include=dev && npm run build && npm run migrate && npm run setup`
+(the `--include=dev` is required — `NODE_ENV=production` makes plain `npm install` skip
+devDependencies, which breaks the client build since `vite` is one),
 Start Command `npm start`, plan Free, then add the same env vars by hand plus
 `NODE_ENV=production` and `DATABASE_SSL=true`.)
 
