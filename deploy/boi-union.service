@@ -1,0 +1,25 @@
+[Unit]
+Description=BOI Union app
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+# Run as a dedicated, non-root system user (see deploy/SETUP.md step 4).
+User=boiunion
+Group=boiunion
+WorkingDirectory=/opt/boi_union
+EnvironmentFile=/opt/boi_union/.env
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=5
+
+# Basic hardening — the service can't write outside its own directory,
+# escalate privileges, or see other users' processes.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/boi_union
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

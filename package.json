@@ -1,0 +1,22 @@
+{
+  "name": "boi-union",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bank of India Employees' Union (MP State) — membership & monthly contribution management",
+  "license": "UNLICENSED",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w server",
+    "dev:web": "npm run dev -w client",
+    "build": "npm run build -w client",
+    "start": "npm run start -w server",
+    "migrate": "npm run migrate -w server",
+    "setup": "npm run setup -w server"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

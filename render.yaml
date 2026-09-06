@@ -1,0 +1,29 @@
+# Render "Blueprint" — lets Render auto-configure the service when you connect
+# this repo (New > Blueprint), instead of filling in build/start commands by hand.
+# Env vars marked `sync: false` are NOT stored here — Render prompts you to type
+# them in once when the blueprint is applied.
+#
+# The build command runs migrate + setup on every deploy; both are idempotent
+# (migrate tracks applied migrations, setup skips if the admin already exists),
+# so this is safe to leave in place for future deploys too.
+
+services:
+  - type: web
+    name: boi-union
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build && npm run migrate && npm run setup
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_SSL
+        value: "true"
+      - key: DATABASE_URL
+        sync: false   # Supabase connection string (Direct connection URI)
+      - key: SESSION_SECRET
+        sync: false   # generate with: openssl rand -hex 32
+      - key: ADMIN_USER
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
