@@ -52,6 +52,70 @@ test('CSV and Excel retain the same normalized import shape', () => {
   assert.deepEqual(parseUnionWorkbook(excel), parseUnionCsv(csv));
 });
 
+test('CSV and Excel find a complete header within the first five rows', async (context) => {
+  const data = [
+    ['S.NO', 'EMP ID', 'EMP NAME', 'LOCATION', 'GRADE', 'UNION CODE-INDORE ZONE 1'],
+    [1, '100000', 'Member Zero', 'Branch 0', 'CK1', 0],
+    [2, '100001', 'Member One', 'Branch 1', 'SS1', 50],
+  ];
+  const expected = parseUnionCsv(data.map((row) => row.join(',')).join('\n'));
+  const preamble = [
+    ['Salary register deductions'],
+    ['SN', 'Reference only'],
+    [],
+    ['EMPLOYEE ID', 'Register heading'],
+  ];
+  for (let headerRow = 1; headerRow <= 5; headerRow++) {
+    await context.test(`header on row ${headerRow}`, () => {
+      const cells = [...preamble.slice(0, headerRow - 1), ...data];
+      const csv = cells.map((row) => row.join(',')).join('\n');
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(cells), 'Register');
+      const excel = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+      assert.deepEqual(parseUnionCsv(csv), expected);
+      assert.deepEqual(parseUnionWorkbook(excel), expected);
+    });
+  }
+});
+
+test('CSV and Excel report header errors only after checking the first five rows', () => {
+  const cases = [
+    {
+      cells: [
+        ...Array.from({ length: 5 }, () => ['Salary register heading']),
+        ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1'],
+        ['100000', 'Member Zero', 'Branch 0', 'CK1', 100],
+      ],
+      message: /first 5 rows/,
+    },
+    {
+      cells: [
+        ...Array.from({ length: 5 }, () => []),
+        ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1'],
+        ['100000', 'Member Zero', 'Branch 0', 'CK1', 100],
+      ],
+      message: /first 5 rows/,
+    },
+    {
+      cells: [['Salary register'], ['SN', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1']],
+      message: /Header is missing required columns/,
+    },
+    {
+      cells: [['Salary register'], ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE']],
+      message: /No union\/deduction columns/,
+    },
+  ];
+  for (const { cells, message } of cases) {
+    const csv = cells.map((row) => row.join(',')).join('\n');
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(cells), 'Register');
+    const excel = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    const matches = (error) => error.status === 400 && message.test(error.message);
+    assert.throws(() => parseUnionCsv(csv), matches);
+    assert.throws(() => parseUnionWorkbook(excel), matches);
+  }
+});
+
 test('bulk import PostgreSQL integration', {
   skip: !process.env.INGEST_TEST_DATABASE_URL,
 }, async (t) => {

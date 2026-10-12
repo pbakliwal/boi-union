@@ -8,7 +8,7 @@
 //
 // The bank's export layout varies month to month (column order, names,
 // SN column, TOTAL vs NIL, UNION CODE- prefixes, extra preamble rows). The
-// parser therefore scans for the header row rather than assuming a fixed
+// parser therefore scans the first five rows for a complete header rather than assuming a fixed
 // position, resolves columns by alias, and treats every non-standard column
 // as a union bucket, summing them for the amount.
 
@@ -18,15 +18,16 @@ const { createHash } = require('crypto');
 const ZONE_NAME = 'Indore';
 const DISTRICT_NAME = 'Indore';
 
-// Serial-number column labels — a row whose first cell is one of these is
-// treated as the header row (the real table starts there), regardless of how
-// many blank/preamble rows precede it in the export.
+// Serial-number column labels identify header-like rows in the export.
 const SN_TOKENS = new Set(['SN', 'S.NO', 'S NO', 'SR', 'SR.NO', 'SRNO', 'SL NO', 'SL.NO', 'SLNO', 'S/N', '#']);
 const EMP_ID_ALIASES = ['EMPLOYEE ID', 'EMP ID'];
+const EMP_NAME_ALIASES = ['EMPLOYEE NAME', 'NAME', 'EMP NAME'];
+const LOCATION_ALIASES = ['LOCATION DESCRIPTION', 'LOC_DESCR', 'LOCATION', 'BRANCH'];
+const SCALE_ALIASES = ['SCALE', 'GRADE'];
 
 // Columns that are NOT union buckets (everything else in the header is).
 const META_COLUMNS = new Set([
-  'SN', 'S.NO', 'S NO', 'SR', 'SRNO',
+  ...SN_TOKENS,
   'EMPLOYEE ID', 'EMP ID', 'EMPLOYEE NAME', 'NAME', 'EMP NAME',
   'MOB', 'MOBILE', 'PHONE',
   'LOC_DESCR', 'LOCATION DESCRIPTION', 'LOCATION', 'BRANCH',
@@ -34,9 +35,7 @@ const META_COLUMNS = new Set([
   'DOB', 'DOJ', 'GENDER', 'SEX', 'TOTAL', 'NIL',
 ]);
 
-// A row is the header row if its first cell is an SN-style label, OR any cell
-// is an Employee-ID-style label. Whichever condition is met first (scanning
-// top to bottom) wins, so this works for exports with or without an SN column.
+// Recognize header-like rows to preserve column errors if no complete header is found.
 function isHeaderRow(cells) {
   const first = String(cells[0] || '').trim().toUpperCase();
   if (SN_TOKENS.has(first)) return true;
@@ -122,17 +121,23 @@ function firstIndex(colMap, aliases) {
 }
 
 // Parse the whole file into normalized rows. Returns { rows, unionCols }.
-// Scans row by row (ignoring any number of preamble/title rows above the
-// real table) and treats the first row matching isHeaderRow() as the header.
+// Find a complete header in the first five rows, ignoring preceding titles and blanks.
 function parseUnionCsv(text) {
   const clean = String(text).replace(/^﻿/, '');
   const lines = clean.split(/\r\n|\n|\r/);
   const allCells = lines.map((l) => splitCsvLine(l));
 
-  const headerIdx = allCells.findIndex(isHeaderRow);
+  const headerRows = allCells.slice(0, 5);
+  let headerIdx = headerRows.findIndex((cells) => {
+    const names = cells.map((cell) => String(cell || '').trim().toUpperCase());
+    return [EMP_ID_ALIASES, EMP_NAME_ALIASES, LOCATION_ALIASES, SCALE_ALIASES]
+      .every((aliases) => aliases.some((name) => names.includes(name))) &&
+      names.some((name) => name && !META_COLUMNS.has(name));
+  });
+  if (headerIdx === -1) headerIdx = headerRows.findIndex(isHeaderRow);
   if (headerIdx === -1) {
     const err = new Error(
-      'Could not find the header row (expected a first column like "SN", or an "EMPLOYEE ID" column).'
+      'Could not find the header row in the first 5 rows (expected a first column like "SN", or an "EMPLOYEE ID" column).'
     );
     err.status = 400;
     throw err;
@@ -143,10 +148,10 @@ function parseUnionCsv(text) {
   header.forEach((name, i) => { if (name) col[name.toUpperCase()] = i; });
 
   const idEmp = firstIndex(col, EMP_ID_ALIASES);
-  const idName = firstIndex(col, ['EMPLOYEE NAME', 'NAME', 'EMP NAME']);
+  const idName = firstIndex(col, EMP_NAME_ALIASES);
   const idGender = firstIndex(col, ['GENDER', 'SEX']);
-  const idLoc = firstIndex(col, ['LOCATION DESCRIPTION', 'LOC_DESCR', 'LOCATION', 'BRANCH']);
-  const idScale = firstIndex(col, ['SCALE', 'GRADE']);
+  const idLoc = firstIndex(col, LOCATION_ALIASES);
+  const idScale = firstIndex(col, SCALE_ALIASES);
   const idDoj = firstIndex(col, ['DOJ']);
   const idMobile = firstIndex(col, ['MOB', 'MOBILE', 'PHONE']);
   if ([idEmp, idName, idLoc, idScale].some((x) => x === undefined)) {

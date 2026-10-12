@@ -188,12 +188,12 @@ Retrying its already-successful file simply returns the receipt even if the mont
 schema and never modifies application tables. It checks bounded query counts, retries,
 rollback, duplicate rejection, concurrent imports, backfills and finalized-month behavior.
 
-**Header detection is layout-agnostic.** The parser scans every row (ignoring however many
-title/preamble rows precede the real table) and treats the first row matching either signal as
-the header: a first cell that looks like a serial-number column (`SN`, `S.NO`, `SR`, …), or any
-cell that looks like an Employee-ID column. Whichever appears first in the file wins, so it
-works whether or not the export has a leading SN column, and columns can be reordered/renamed
-month to month.
+**Header detection checks the first five rows.** For both CSV and Excel, the parser selects
+the first complete header containing Employee ID, Name, Location/Branch, Scale/Grade, and a
+union/deduction column, using the supported column aliases. Titles and blank rows above it
+are ignored, but count toward the five-row limit. Employee data is parsed from the following
+row. A leading `SN` column is optional, and columns can be reordered. If no valid header is
+found in those five rows, the import reports the existing header or missing-column error.
 
 ⚠️ **Security note:** the npm-published `xlsx` package has known unpatched vulnerabilities
 (prototype pollution, ReDoS — no fix on the npm registry). This project instead installs the
