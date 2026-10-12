@@ -80,7 +80,7 @@ export default function Audit() {
             ← Back to months
           </Link>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="page-actions">
           {isAdmin && p?.status === 'draft' && (
             <button className="btn primary" onClick={finalize}>
               Finalize month
@@ -99,7 +99,7 @@ export default function Audit() {
         </div>
       </div>
 
-      <div className="panel" style={{ display: 'flex', gap: 30 }}>
+      <div className="panel audit-summary">
         <div>
           <div className="muted">Members</div>
           <strong style={{ fontSize: 18 }}>{rows.length}</strong>

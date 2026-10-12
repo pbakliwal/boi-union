@@ -1,4 +1,6 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { Menu, X } from 'lucide-react';
+import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '../auth.jsx';
 
 const masterLinks = [
@@ -19,11 +21,75 @@ const reportLinks = [
 
 export default function Layout() {
   const { user, logout, isAdmin } = useAuth();
+  const { pathname } = useLocation();
+  const [navOpen, setNavOpen] = useState(false);
+  const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 768px)').matches);
+  const sidebarRef = useRef(null);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 768px)');
+    const onChange = () => {
+      setIsMobile(media.matches);
+      setNavOpen(false);
+    };
+    media.addEventListener('change', onChange);
+    return () => media.removeEventListener('change', onChange);
+  }, []);
+
+  useEffect(() => {
+    setNavOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!navOpen || !isMobile) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const focusFrame = requestAnimationFrame(() => sidebarRef.current.querySelector('button').focus());
+    const onKey = (event) => {
+      if (event.key === 'Escape') setNavOpen(false);
+      if (event.key !== 'Tab') return;
+      const controls = sidebarRef.current.querySelectorAll('a[href], button');
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      cancelAnimationFrame(focusFrame);
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener('keydown', onKey);
+      if (window.matchMedia('(max-width: 768px)').matches) menuRef.current?.focus();
+    };
+  }, [navOpen, isMobile]);
 
   return (
     <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
+      {isMobile && navOpen && (
+        <button className="nav-backdrop" aria-label="Close navigation" tabIndex={-1} onClick={() => setNavOpen(false)} />
+      )}
+      <aside
+        id="app-navigation"
+        ref={sidebarRef}
+        className={`sidebar${navOpen ? ' is-open' : ''}`}
+        role={isMobile && navOpen ? 'dialog' : undefined}
+        aria-modal={isMobile && navOpen ? true : undefined}
+        aria-labelledby="navigation-brand"
+        {...(isMobile && !navOpen ? { inert: '' } : {})}
+        onClick={(event) => {
+          if (event.target.closest('a')) setNavOpen(false);
+        }}
+      >
+        <button className="btn nav-close" aria-label="Close navigation" title="Close navigation" onClick={() => setNavOpen(false)}>
+          <X size={22} aria-hidden="true" />
+        </button>
+        <div className="brand" id="navigation-brand">
           BOI Employees' Union
           <small>Madhya Pradesh</small>
         </div>
@@ -68,10 +134,23 @@ export default function Layout() {
         )}
       </aside>
 
-      <div className="main">
+      <div className="main" {...(isMobile && navOpen ? { inert: '' } : {})}>
         <div className="topbar">
-          <div />
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div className="topbar-start">
+            <button
+              ref={menuRef}
+              className="btn menu-toggle"
+              aria-label="Open navigation"
+              aria-controls="app-navigation"
+              aria-expanded={navOpen}
+              title="Open navigation"
+              onClick={() => setNavOpen(true)}
+            >
+              <Menu size={22} aria-hidden="true" />
+            </button>
+            <span className="mobile-brand">BOI Union</span>
+          </div>
+          <div className="topbar-account">
             <span className="who">
               {user?.username} · {user?.role}
             </span>
