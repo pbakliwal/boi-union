@@ -47,7 +47,11 @@ router.post(
       else await client.query('ROLLBACK');
       res.json({ dryRun: !commit, parsedRows: rows.length, ...summary });
     } catch (err) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Import rollback failed (connection may have been lost):', rollbackError.message);
+      }
       throw err;
     } finally {
       client.release();

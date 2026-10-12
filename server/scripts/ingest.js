@@ -62,7 +62,11 @@ async function main() {
     }
     console.log(JSON.stringify(summary, null, 2));
   } catch (err) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Import rollback failed (connection may have been lost):', rollbackError.message);
+    }
     console.error('Ingest failed:', err.message);
     process.exitCode = 1;
   } finally {
@@ -70,4 +74,9 @@ async function main() {
   }
 }
 
-main().then(() => pool.end());
+main()
+  .catch((err) => {
+    console.error('Ingest failed:', err.message);
+    process.exitCode = 1;
+  })
+  .finally(() => pool.end());

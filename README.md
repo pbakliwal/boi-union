@@ -111,7 +111,36 @@ expected rate** (`differs`) so it stands out in the audit grid. Each contributio
 its own month's branch/category/amount, so per-month reports stay accurate even after a member
 transfers.
 
-**Master data vs. the report.** Re-importing a month only rewrites *that month's contributions*
+### Bulk writes and safe retries
+
+Imports use set-based PostgreSQL writes (JSON recordsets), not one SQL round-trip per
+member. Roughly 500 members are imported in one transaction, with a bounded number of
+queries independent of the member count. Preview executes the same bulk path but rolls
+it back.
+
+- **All or nothing:** members, masters, contributions and the import receipt commit
+  together. A database error or server crash before commit leaves no partial import.
+  Retry the whole file rather than resuming at a row number.
+- **Lost response after commit:** retrying the same parsed file, month and options
+  returns the last successful receipt (`alreadyApplied: true`), without rewriting data
+  or undoing manually corrected amounts. This works across server restarts.
+- **No duplicates:** Employee ID and month/member uniqueness constraints remain the
+  final database safeguard. Duplicate Employee IDs inside a file are rejected with an
+  actionable error instead of silently choosing a row.
+- **Changed file:** a different file replaces that month's draft atomically, as before,
+  including any manual corrections. A finalized month must first be reopened.
+- **Concurrent imports:** a transaction-scoped advisory lock serializes imports across
+  months to keep the latest roster consistent. A period row lock protects against
+  finalization during import. Locks release automatically on transaction completion.
+- **Receipt lifetime:** only the latest successful file receipt for each period is
+  retained. Deleting the month or regenerating its draft clears it. Re-uploading an
+  earlier, different file after a replacement is a new replacement, not a retry.
+
+Run `npm run migrate` before starting the updated server (including on Supabase/Render).
+No system can guarantee that a database or network never fails; this design guarantees
+atomic data changes and safe same-file retries rather than partial progress.
+
+**Master data vs. the report.** Importing a changed file for a month only rewrites *that month's contributions*
 (the report) — it never wipes master data. The member roster (branch/category/active-or-left)
 is synced **only when importing the latest month**; importing an **older** month is a back-fill
 that records just its contributions and leaves the current master untouched. The export layout
@@ -133,6 +162,11 @@ intact.
 
 **In the app (admin):** *Import Salary Register* → choose the CSV or Excel file, confirm
 month/year, **Preview** (dry-run, nothing saved) → review the summary + flagged list → **Apply**.
+After applying, edit flagged amounts directly in the import result and click **Save** on each
+row. If a missing deduction has been collected, also check **Received** so it counts in
+reports. Corrections are saved to the monthly draft; finalized months must be reopened before
+editing. Flags and import remarks retain the original file's anomalies, and the import summary
+shows the original totals before manual edits. Open the draft to edit remarks or other entries.
 
 **From the CLI:**
 ```bash
@@ -146,6 +180,13 @@ node server/scripts/ingest.js data/AUG26.xlsx --dry   # parse + run, then roll b
 ```
 Month/year are inferred from a `MONYY` token in the filename (e.g. `…APR26…` → April 2026)
 when the flags are omitted. A finalized month must be reopened before it can be re-imported.
+Retrying its already-successful file simply returns the receipt even if the month is finalized.
+
+**Import regression tests:** `npm run test -w server` runs validation tests; set
+`INGEST_TEST_DATABASE_URL` to a PostgreSQL connection string to additionally run the
+500-member integration suite. The suite creates and removes a randomly named isolated
+schema and never modifies application tables. It checks bounded query counts, retries,
+rollback, duplicate rejection, concurrent imports, backfills and finalized-month behavior.
 
 **Header detection is layout-agnostic.** The parser scans every row (ignoring however many
 title/preamble rows precede the real table) and treats the first row matching either signal as

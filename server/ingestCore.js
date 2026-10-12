@@ -13,6 +13,7 @@
 // as a union bucket, summing them for the amount.
 
 const XLSX = require('xlsx');
+const { createHash } = require('crypto');
 
 const ZONE_NAME = 'Indore';
 const DISTRICT_NAME = 'Indore';
@@ -242,8 +243,46 @@ async function ensureZoneDistrict(client, summary) {
 
 // Main entry. Caller owns the transaction (client). month/year are the period.
 async function runIngest(client, { month, year, rows, markLeft = true }) {
+  const invalid = (message) => {
+    const err = new Error(message);
+    err.status = 400;
+    throw err;
+  };
+  if (!Number.isInteger(month) || month < 1 || month > 12 ||
+      !Number.isInteger(year) || year < 2000 || year > 2100) {
+    invalid('Import month/year is out of range.');
+  }
+  if (!rows.length) invalid('No employee rows found in the file.');
+  const seen = new Set();
+  for (const row of rows) {
+    if (!row.employee_id || !row.branch) invalid(`Employee ${row.employee_id || '(missing ID)'} has no ID or branch.`);
+    if (seen.has(row.employee_id)) invalid(`Duplicate Employee ID ${row.employee_id} in the file. Remove the duplicate row before importing.`);
+    if (!Number.isFinite(row.amount) || row.amount < 0 || row.amount > 9999999999.99) {
+      invalid(`Invalid deduction amount for employee ${row.employee_id}.`);
+    }
+    seen.add(row.employee_id);
+  }
+
+  const hash = createHash('sha256').update(JSON.stringify({ month, year, rows, markLeft })).digest('hex');
   const periodStart = `${year}-${String(month).padStart(2, '0')}-01`;
-  const periodEnd = new Date(year, month, 0).toISOString().slice(0, 10); // last day of month
+  const periodEnd = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+
+  // Serialize imports across months because they share the latest master roster.
+  // Transaction-scoped locks are released on commit, rollback or connection loss.
+  await client.query('select pg_advisory_xact_lock(1112492361)');
+  await client.query(
+    `insert into periods (month, year, status) values ($1, $2, 'draft')
+     on conflict (month, year) do nothing`,
+    [month, year]
+  );
+  const period = (await client.query(
+    'select id, status, import_hash, import_summary from periods where month = $1 and year = $2 for update',
+    [month, year]
+  )).rows[0];
+  if (period.import_hash === hash && period.import_summary) {
+    return { ...period.import_summary, alreadyApplied: true };
+  }
+  if (period.status === 'final') invalid(`${month}/${year} is finalized — reopen it before re-importing.`);
 
   const summary = {
     month, year,
@@ -268,125 +307,78 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
 
   const { districtId } = await ensureZoneDistrict(client, summary);
 
-  // Period must be a draft (create if new; refuse if finalized).
-  let period = (await client.query('select id, status from periods where month = $1 and year = $2', [month, year])).rows[0];
-  if (period && period.status === 'final') {
-    const err = new Error(`${month}/${year} is finalized — reopen it before re-importing.`);
-    err.status = 400;
-    throw err;
-  }
-  if (!period) {
-    period = (await client.query('insert into periods (month, year, status) values ($1, $2, $3) returning id', [month, year, 'draft'])).rows[0];
-  }
-  await client.query('delete from contributions where period_id = $1', [period.id]);
-
-  // Caches
-  const catCache = new Map();     // scale code -> { id, expected }
-  const branchCache = new Map();  // branch name -> id
-  const catIdExpected = new Map(); // category id -> expected amount
-
-  (await client.query('select id, code from categories')).rows.forEach((c) => catCache.set(c.code.toUpperCase(), { id: c.id, expected: undefined }));
-  (await client.query('select id, name from branches where district_id = $1', [districtId])).rows.forEach((b) => branchCache.set(b.name, b.id));
-
-  async function ensureCategory(code) {
-    let entry = catCache.get(code);
-    if (!entry) {
-      const ins = await client.query('insert into categories (code, name) values ($1, $2) returning id', [code, code]);
-      entry = { id: ins.rows[0].id, expected: undefined };
-      catCache.set(code, entry);
-      summary.masters.categoriesCreated++;
-    }
-    if (entry.expected === undefined) {
-      const rate = (await client.query(
-        'select amount from rates where category_id = $1 and effective_from <= $2 order by effective_from desc limit 1',
-        [entry.id, periodStart]
-      )).rows[0];
-      if (rate) {
-        entry.expected = Number(rate.amount);
-      } else {
-        const rule = expectedRate(code);
-        if (rule != null) {
-          await client.query('insert into rates (category_id, amount, effective_from) values ($1, $2, $3)', [entry.id, rule, '2000-01-01']);
-        }
-        entry.expected = rule; // may be null
-      }
-      catIdExpected.set(entry.id, entry.expected);
-    }
-    return entry;
+  const ids = [...seen];
+  const existingMembers = new Map((await client.query(
+    'select id, employee_id, category_id from members where employee_id = any($1::text[])',
+    [ids]
+  )).rows.map((m) => [m.employee_id, m]));
+  const branchCache = new Map((await client.query(
+    'select id, name from branches where district_id = $1', [districtId]
+  )).rows.map((b) => [b.name, b.id]));
+  const missingBranches = [...new Set(rows.map((r) => r.branch))].filter((name) => !branchCache.has(name));
+  if (missingBranches.length) {
+    const inserted = await client.query(
+      `insert into branches (code, name, district_id)
+       select name, name, $2 from jsonb_array_elements_text($1::jsonb) as input(name)
+       returning id, name`,
+      [JSON.stringify(missingBranches), districtId]
+    );
+    summary.masters.branchesCreated = inserted.rowCount;
+    inserted.rows.forEach((b) => branchCache.set(b.name, b.id));
   }
 
-  async function expectedForCatId(catId) {
-    if (catIdExpected.has(catId)) return catIdExpected.get(catId);
-    const rate = (await client.query(
-      'select amount from rates where category_id = $1 and effective_from <= $2 order by effective_from desc limit 1',
-      [catId, periodStart]
-    )).rows[0];
-    const val = rate ? Number(rate.amount) : null;
-    catIdExpected.set(catId, val);
-    return val;
-  }
-
-  async function ensureBranch(name) {
-    let id = branchCache.get(name);
-    if (!id) {
-      const ins = await client.query('insert into branches (code, name, district_id) values ($1, $2, $3) returning id', [name, name, districtId]);
-      id = ins.rows[0].id;
-      branchCache.set(name, id);
-      summary.masters.branchesCreated++;
-    }
-    return id;
-  }
-
-  const seen = [];
+  const catCache = new Map((await client.query('select id, code from categories')).rows.map((c) => [c.code.toUpperCase(), c.id]));
+  const usedCodes = new Set();
   for (const r of rows) {
-    if (!r.employee_id || !r.branch) continue;
-    const branchId = await ensureBranch(r.branch);
-
-    const existing = (await client.query('select id, category_id from members where employee_id = $1', [r.employee_id])).rows[0];
-
-    // Resolve category + expected rate. A missing/#N/A scale keeps the member's
-    // existing category (so a transfer with a blanked scale isn't clobbered).
-    const scaleValid = r.scale && !r.scale.includes('#');
-    let catId;
-    let expected;
-    if (scaleValid) {
-      const cat = await ensureCategory(r.scale);
-      catId = cat.id;
-      expected = cat.expected;
-    } else if (existing && existing.category_id) {
-      catId = existing.category_id;
-      expected = await expectedForCatId(catId);
-    } else {
-      const cat = await ensureCategory('NA');
-      catId = cat.id;
-      expected = cat.expected;
+    if (r.scale && !r.scale.includes('#')) usedCodes.add(r.scale);
+    else if (!existingMembers.has(r.employee_id)) usedCodes.add('NA');
+  }
+  const missingCodes = [...usedCodes].filter((code) => !catCache.has(code));
+  if (missingCodes.length) {
+    const inserted = await client.query(
+      `insert into categories (code, name)
+       select code, code from jsonb_array_elements_text($1::jsonb) as input(code)
+       returning id, code`,
+      [JSON.stringify(missingCodes)]
+    );
+    summary.masters.categoriesCreated = inserted.rowCount;
+    inserted.rows.forEach((c) => catCache.set(c.code.toUpperCase(), c.id));
+  }
+  const expectedByCat = new Map((await client.query(
+    `select distinct on (category_id) category_id, amount from rates
+     where effective_from <= $1 order by category_id, effective_from desc`,
+    [periodStart]
+  )).rows.map((r) => [r.category_id, Number(r.amount)]));
+  const defaultRates = [];
+  for (const code of usedCodes) {
+    const categoryId = catCache.get(code);
+    const amount = expectedRate(code);
+    if (!expectedByCat.has(categoryId) && amount != null) {
+      defaultRates.push({ category_id: categoryId, amount });
+      expectedByCat.set(categoryId, amount);
     }
+  }
+  if (defaultRates.length) {
+    await client.query(
+      `insert into rates (category_id, amount, effective_from)
+       select category_id, amount, '2000-01-01'::date
+       from jsonb_to_recordset($1::jsonb) as input(category_id integer, amount numeric)
+       on conflict (category_id, effective_from) do nothing`,
+      [JSON.stringify(defaultRates)]
+    );
+  }
 
-    // Upsert member by employee_id. Existing members are only mutated when this
-    // is the latest month (a back-fill leaves the master roster as-is).
-    let memberId;
+  const entries = [];
+  for (const r of rows) {
+    const existing = existingMembers.get(r.employee_id);
+    const catId = r.scale && !r.scale.includes('#')
+      ? catCache.get(r.scale)
+      : existing?.category_id || catCache.get('NA');
+    const expected = expectedByCat.get(catId) ?? null;
     if (existing) {
-      memberId = existing.id;
-      if (isLatest) {
-        await client.query(
-          `update members set name=$1, sex=$2, mobile=coalesce($3, mobile), category_id=$4, branch_id=$5,
-             active=true, left_on=null, joined_on = coalesce($6, joined_on) where id=$7`,
-          [r.name, r.sex, r.mobile, catId, branchId, r.joined_on, memberId]
-        );
-        summary.employees.updated++;
-      } else {
-        summary.employees.unchanged++;
-      }
-    } else {
-      const ins = await client.query(
-        `insert into members (employee_id, name, sex, mobile, category_id, branch_id, active, joined_on)
-         values ($1,$2,$3,$4,$5,$6,true,$7) returning id`,
-        [r.employee_id, r.name, r.sex, r.mobile, catId, branchId, r.joined_on]
-      );
-      memberId = ins.rows[0].id;
-      summary.employees.created++;
-    }
-    seen.push(r.employee_id);
+      if (isLatest) summary.employees.updated++;
+      else summary.employees.unchanged++;
+    } else summary.employees.created++;
 
     // Flag: zero amount, off-rate amount, or an amount with no known rate.
     let flag = null;
@@ -401,14 +393,7 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
     if (flag === 'zero') notes.push('no deduction');
     const remarks = notes.join('; ') || null;
 
-    await client.query(
-      `insert into contributions (period_id, member_id, branch_id, category_id, amount, received, flag, remarks, entry_date)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       on conflict (period_id, member_id) do update set
-         branch_id=excluded.branch_id, category_id=excluded.category_id, amount=excluded.amount,
-         received=excluded.received, flag=excluded.flag, remarks=excluded.remarks`,
-      [period.id, memberId, branchId, catId, r.amount, r.amount > 0, flag, remarks, periodStart]
-    );
+    entries.push({ ...r, category_id: catId, branch_id: branchCache.get(r.branch), flag, remarks });
 
     summary.contributions.total++;
     if (r.amount > 0) summary.contributions.totalAmount += r.amount;
@@ -417,6 +402,34 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
     if (flag) summary.flagged.push({ employee_id: r.employee_id, name: r.name, branch: r.branch, scale: r.scale, amount: r.amount, expected, flag });
   }
 
+  const payload = JSON.stringify(entries);
+  await client.query(
+    `insert into members (employee_id, name, sex, mobile, category_id, branch_id, active, joined_on)
+     select employee_id, name, sex, mobile, category_id, branch_id, true, joined_on
+     from jsonb_to_recordset($1::jsonb) as input(
+       employee_id text, name text, sex char(1), mobile text,
+       category_id integer, branch_id integer, joined_on date)
+     on conflict (employee_id) do update set
+       name=excluded.name, sex=excluded.sex, mobile=coalesce(excluded.mobile, members.mobile),
+       category_id=excluded.category_id, branch_id=excluded.branch_id,
+       active=true, left_on=null, joined_on=coalesce(excluded.joined_on, members.joined_on)
+     where $2::boolean`,
+    [payload, isLatest]
+  );
+  await client.query('delete from contributions where period_id = $1', [period.id]);
+  await client.query(
+    `insert into contributions (period_id, member_id, branch_id, category_id, amount, received, flag, remarks, entry_date)
+     select $2, m.id, input.branch_id, input.category_id, input.amount,
+            input.amount > 0, input.flag, input.remarks, $3::date
+     from jsonb_to_recordset($1::jsonb) as input(
+       employee_id text, branch_id integer, category_id integer, amount numeric, flag text, remarks text)
+     join members m on m.employee_id = input.employee_id
+     on conflict (period_id, member_id) do update set
+       branch_id=excluded.branch_id, category_id=excluded.category_id, amount=excluded.amount,
+       received=excluded.received, flag=excluded.flag, remarks=excluded.remarks`,
+    [payload, period.id, periodStart]
+  );
+
   // Mark employees in this district who are absent from the file as left —
   // only when importing the latest month (never on a back-fill).
   if (markLeft && isLatest) {
@@ -424,12 +437,16 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
       `update members set active=false, left_on=$1
        where active=true and branch_id in (select id from branches where district_id=$2)
          and not (employee_id = any($3::text[]))`,
-      [periodEnd, districtId, seen]
+      [periodEnd, districtId, ids]
     );
     summary.employees.markedLeft = res.rowCount;
   }
 
   summary.periodId = period.id;
+  await client.query(
+    'update periods set import_hash = $1, import_summary = $2::jsonb where id = $3',
+    [hash, JSON.stringify(summary), period.id]
+  );
   return summary;
 }
 
