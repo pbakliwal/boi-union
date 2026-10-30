@@ -31,10 +31,14 @@ export default function Import() {
   const [filename, setFilename] = useState('');
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [year, setYear] = useState(CURRENT_YEAR);
+  const [zoneName, setZoneName] = useState('');
+  const [districtName, setDistrictName] = useState('');
   const [preview, setPreview] = useState(null);
   const [applied, setApplied] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const zones = useFetch(isAdmin ? '/api/zones' : null);
+  const districts = useFetch(isAdmin ? '/api/districts' : null);
 
   if (!isAdmin) return <div className="empty">Admins only.</div>;
 
@@ -62,17 +66,19 @@ export default function Import() {
     setError(null);
     setApplied(null);
     try {
-      const body = xlsx ? { month, year, xlsx, commit } : { month, year, csv, commit };
+      const body = { month, year, zoneName, districtName, commit, ...(xlsx ? { xlsx } : { csv }) };
       const res = await api.post('/api/ingest', body);
       if (commit) {
         setApplied(res);
         setPreview(null);
+        zones.reload();
+        districts.reload();
       } else {
         setPreview(res);
       }
     } catch (e) {
       setError(commit
-        ? `${e.message} Retry Apply import with the same file and month. Failed transactions leave no partial data; completed imports are detected automatically.`
+        ? `${e.message} Retry Apply import with the same file, month and district. Failed transactions leave no partial data; completed imports are detected automatically.`
         : e.message);
     } finally {
       setBusy(false);
@@ -84,12 +90,6 @@ export default function Import() {
       <div className="page-head">
         <h1>Import salary register</h1>
       </div>
-      <p className="muted">
-        Upload the bank's monthly deduction file — a CSV export or the original Excel workbook. It
-        updates branches, categories and employees, then builds that month's <strong>draft</strong> —
-        flagging any zero or off-rate amount for review. Employees in Indore missing from the file
-        are marked <em>left</em>.
-      </p>
 
       <div className="panel">
         <div className="toolbar">
@@ -114,7 +114,21 @@ export default function Import() {
             <label>Year</label>
             <input type="number" disabled={busy} value={year} style={{ width: 100 }} onChange={(e) => { setYear(Number(e.target.value)); setPreview(null); setApplied(null); }} />
           </div>
-          <button className="btn" disabled={(!csv && !xlsx) || busy} onClick={() => run(false)}>
+          <div className="field">
+            <label htmlFor="import-zone">Zone</label>
+            <input id="import-zone" type="text" list="import-zones" required disabled={busy} value={zoneName} onChange={(e) => { setZoneName(e.target.value); setDistrictName(''); setPreview(null); setApplied(null); }} />
+            <datalist id="import-zones">
+              {(zones.data || []).map((zone) => <option key={zone.id} value={zone.name} />)}
+            </datalist>
+          </div>
+          <div className="field">
+            <label htmlFor="import-district">District</label>
+            <input id="import-district" type="text" list="import-districts" required disabled={busy || !zoneName.trim()} value={districtName} onChange={(e) => { setDistrictName(e.target.value); setPreview(null); setApplied(null); }} />
+            <datalist id="import-districts">
+              {(districts.data || []).filter((district) => district.zone_name.toLowerCase() === zoneName.trim().toLowerCase()).map((district) => <option key={district.id} value={district.name} />)}
+            </datalist>
+          </div>
+          <button className="btn" disabled={(!csv && !xlsx) || !zoneName.trim() || !districtName.trim() || busy} onClick={() => run(false)}>
             {busy ? 'Working…' : 'Preview'}
           </button>
         </div>
@@ -174,7 +188,8 @@ export default function Import() {
 
 function AppliedFlagged({ summary }) {
   const contributions = useFetch(`/api/periods/${summary.periodId}/contributions`);
-  const rows = contributions.data?.filter((r) => r.flag) || [];
+  const importedIds = new Set(summary.flagged.map((row) => row.employee_id));
+  const rows = contributions.data?.filter((row) => row.flag && importedIds.has(row.employee_id)) || [];
 
   async function save(rowId, patch) {
     try {
@@ -302,16 +317,17 @@ function Summary({ s }) {
   );
   return (
     <>
+      <div style={{ margin: '6px 0' }}><strong>{s.zoneName}</strong> / {s.districtName}</div>
       {s.alreadyApplied && (
         <p className="muted">
           Showing the saved receipt for this file. No records were rewritten and manual corrections
-          were preserved. A changed file replaces the draft; Generate or Delete clears this receipt.
+          were preserved. A changed file replaces this district's draft; Generate or Delete clears this receipt.
         </p>
       )}
       {s.isLatest === false && (
         <div className="muted" style={{ margin: '6px 0' }}>
-          ↩ Older month than the latest on record — master roster is left untouched; only this
-          month's contributions are written.
+          ↩ Older month than this district's latest on record — master roster is left untouched; only this
+          district's contributions are written.
         </div>
       )}
       <div style={{ display: 'flex', gap: 26, flexWrap: 'wrap', margin: '10px 0' }}>

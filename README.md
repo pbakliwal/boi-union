@@ -104,7 +104,7 @@ config templates live in [deploy/](deploy/) — `boi-union.service` and `nginx.c
 ## Importing the monthly salary register
 
 The bank's monthly "salary register deductions" CSV is the source of truth. Importing it
-**auto-creates masters** (Indore zone/district, each branch, each `SCALE` as a category with
+**auto-creates masters** (the selected zone/district, each branch, each `SCALE` as a category with
 a rate — CK\*=100, SS\*=50), **upserts employees** (keyed by Employee ID), and builds that
 month's **draft** contributions — flagging any amount that is **0/NIL** (`zero`) or **≠ the
 expected rate** (`differs`) so it stands out in the audit grid. Each contribution **snapshots**
@@ -121,28 +121,31 @@ it back.
 - **All or nothing:** members, masters, contributions and the import receipt commit
   together. A database error or server crash before commit leaves no partial import.
   Retry the whole file rather than resuming at a row number.
-- **Lost response after commit:** retrying the same parsed file, month and options
+- **Lost response after commit:** retrying the same parsed file, month, district and options
   returns the last successful receipt (`alreadyApplied: true`), without rewriting data
   or undoing manually corrected amounts. This works across server restarts.
 - **No duplicates:** Employee ID and month/member uniqueness constraints remain the
   final database safeguard. Duplicate Employee IDs inside a file are rejected with an
   actionable error instead of silently choosing a row.
-- **Changed file:** a different file replaces that month's draft atomically, as before,
-  including any manual corrections. A finalized month must first be reopened.
+- **Multiple district files:** Bhopal, Indore and other districts can each upload a file
+  for the same month. A changed file replaces only the selected district's contributions
+  atomically, including its manual corrections; other districts remain untouched.
+  Each upload is a complete roster for the selected district, not a partial branch file.
+  A finalized month must first be reopened.
 - **Concurrent imports:** a transaction-scoped advisory lock serializes imports across
   months to keep the latest roster consistent. A period row lock protects against
   finalization during import. Locks release automatically on transaction completion.
-- **Receipt lifetime:** only the latest successful file receipt for each period is
-  retained. Deleting the month or regenerating its draft clears it. Re-uploading an
+- **Receipt lifetime:** only the latest successful file receipt for each month/district is
+  retained. Deleting the month or regenerating its draft clears all district receipts. Re-uploading an
   earlier, different file after a replacement is a new replacement, not a retry.
 
 Run `npm run migrate` before starting the updated server (including on Supabase/Render).
 No system can guarantee that a database or network never fails; this design guarantees
 atomic data changes and safe same-file retries rather than partial progress.
 
-**Master data vs. the report.** Importing a changed file for a month only rewrites *that month's contributions*
+**Master data vs. the report.** Importing a changed file for a month only rewrites *that district's monthly contributions*
 (the report) — it never wipes master data. The member roster (branch/category/active-or-left)
-is synced **only when importing the latest month**; importing an **older** month is a back-fill
+is synced **only when importing that district's latest month**; importing an **older** month is a back-fill
 that records just its contributions and leaves the current master untouched. The export layout
 varies month to month (column order/names, `UNION CODE-` prefixes, `TOTAL` vs trailing `NIL`,
 quoted commas) — the parser handles all of these.
@@ -161,7 +164,8 @@ notation in a CSV export (e.g. a 12-digit mobile number shown as `9.18085E+11`) 
 intact.
 
 **In the app (admin):** *Import Salary Register* → choose the CSV or Excel file, confirm
-month/year, **Preview** (dry-run, nothing saved) → review the summary + flagged list → **Apply**.
+month/year and enter its zone/district, **Preview** (dry-run, nothing saved) → review the summary + flagged list → **Apply**.
+Existing names are suggested; new zone/district names are created when the import is applied.
 After applying, edit flagged amounts directly in the import result and click **Save** on each
 row. If a missing deduction has been collected, also check **Received** so it counts in
 reports. Corrections are saved to the monthly draft; finalized months must be reopened before
@@ -177,9 +181,11 @@ node server/scripts/ingest.js data/UNION_APR26.xlsx --month 4 --year 2026 --rese
 # subsequent months (incremental: upsert + mark-left, no wipe)
 node server/scripts/ingest.js data/AUG26.xlsx         # month/year inferred from filename
 node server/scripts/ingest.js data/AUG26.xlsx --dry   # parse + run, then roll back
+node server/scripts/ingest.js data/BHOPAL_APR26.xlsx --zone Bhopal --district Bhopal
 ```
 Month/year are inferred from a `MONYY` token in the filename (e.g. `…APR26…` → April 2026)
 when the flags are omitted. A finalized month must be reopened before it can be re-imported.
+CLI imports default to Indore; use `--zone` and `--district` for other scopes.
 Retrying its already-successful file simply returns the receipt even if the month is finalized.
 
 **Import regression tests:** `npm run test -w server` runs validation tests; set

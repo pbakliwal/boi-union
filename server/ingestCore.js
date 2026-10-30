@@ -19,7 +19,7 @@ const ZONE_NAME = 'Indore';
 const DISTRICT_NAME = 'Indore';
 
 // Serial-number column labels identify header-like rows in the export.
-const SN_TOKENS = new Set(['SN', 'S.NO', 'S NO', 'SR', 'SR.NO', 'SRNO', 'SL NO', 'SL.NO', 'SLNO', 'S/N', '#']);
+const SN_TOKENS = new Set(['SN', 'SNO', 'S.NO', 'S NO', 'SR', 'SR.NO', 'SRNO', 'SL NO', 'SL.NO', 'SLNO', 'S/N', '#']);
 const EMP_ID_ALIASES = ['EMPLOYEE ID', 'EMP ID'];
 const EMP_NAME_ALIASES = ['EMPLOYEE NAME', 'NAME', 'EMP NAME'];
 const LOCATION_ALIASES = ['LOCATION DESCRIPTION', 'LOC_DESCR', 'LOCATION', 'BRANCH'];
@@ -232,22 +232,22 @@ function parseUnionWorkbook(buffer) {
 
 // --- Ingest --------------------------------------------------------------
 
-async function ensureZoneDistrict(client, summary) {
-  let z = (await client.query('select id from zones where lower(name) = lower($1)', [ZONE_NAME])).rows[0];
+async function ensureZoneDistrict(client, summary, zoneName, districtName) {
+  let z = (await client.query('select id from zones where lower(name) = lower($1)', [zoneName])).rows[0];
   if (!z) {
-    z = (await client.query('insert into zones (code, name) values ($1, $2) returning id', ['INDORE', ZONE_NAME])).rows[0];
+    z = (await client.query('insert into zones (code, name) values ($1, $2) returning id', [zoneName.toUpperCase(), zoneName])).rows[0];
     summary.masters.zonesCreated++;
   }
-  let d = (await client.query('select id from districts where lower(name) = lower($1) and zone_id = $2', [DISTRICT_NAME, z.id])).rows[0];
+  let d = (await client.query('select id from districts where lower(name) = lower($1) and zone_id = $2', [districtName, z.id])).rows[0];
   if (!d) {
-    d = (await client.query('insert into districts (code, name, zone_id) values ($1, $2, $3) returning id', ['INDORE', DISTRICT_NAME, z.id])).rows[0];
+    d = (await client.query('insert into districts (code, name, zone_id) values ($1, $2, $3) returning id', [`${z.id}:${districtName.toUpperCase()}`, districtName, z.id])).rows[0];
     summary.masters.districtsCreated++;
   }
   return { zoneId: z.id, districtId: d.id };
 }
 
 // Main entry. Caller owns the transaction (client). month/year are the period.
-async function runIngest(client, { month, year, rows, markLeft = true }) {
+async function runIngest(client, { month, year, rows, markLeft = true, zoneName = ZONE_NAME, districtName = DISTRICT_NAME }) {
   const invalid = (message) => {
     const err = new Error(message);
     err.status = 400;
@@ -257,6 +257,12 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
       !Number.isInteger(year) || year < 2000 || year > 2100) {
     invalid('Import month/year is out of range.');
   }
+  if (typeof zoneName !== 'string' || !zoneName.trim() ||
+      typeof districtName !== 'string' || !districtName.trim()) {
+    invalid('Import zone and district names are required.');
+  }
+  zoneName = zoneName.trim();
+  districtName = districtName.trim();
   if (!rows.length) invalid('No employee rows found in the file.');
   const seen = new Set();
   for (const row of rows) {
@@ -284,19 +290,24 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
     'select id, status, import_hash, import_summary from periods where month = $1 and year = $2 for update',
     [month, year]
   )).rows[0];
-  if (period.import_hash === hash && period.import_summary) {
-    return { ...period.import_summary, alreadyApplied: true };
-  }
-  if (period.status === 'final') invalid(`${month}/${year} is finalized — reopen it before re-importing.`);
 
   const summary = {
-    month, year,
+    month, year, zoneName, districtName,
     isLatest: true,
     masters: { zonesCreated: 0, districtsCreated: 0, branchesCreated: 0, categoriesCreated: 0 },
     employees: { created: 0, updated: 0, unchanged: 0, markedLeft: 0 },
     contributions: { total: 0, totalAmount: 0, flaggedZero: 0, flaggedDiffers: 0 },
     flagged: [],
   };
+  const { districtId } = await ensureZoneDistrict(client, summary, zoneName, districtName);
+  const receipt = (await client.query(
+    'select import_hash, import_summary from period_imports where period_id = $1 and district_id = $2',
+    [period.id, districtId]
+  )).rows[0];
+  if (receipt?.import_hash === hash && receipt.import_summary) {
+    return { ...receipt.import_summary, zoneName, districtName, alreadyApplied: true };
+  }
+  if (period.status === 'final') invalid(`${month}/${year} is finalized — reopen it before re-importing.`);
 
   // Master data is only synced when importing the most recent month. Importing
   // an OLDER month just (re)writes that month's contributions (the report) and
@@ -304,13 +315,15 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
   // back-fill never reverts the current master state.
   const periodKey = year * 12 + (month - 1);
   const maxOther = (await client.query(
-    'select coalesce(max(year * 12 + (month - 1)), -1) as k from periods where not (month = $1 and year = $2)',
-    [month, year]
+    `select coalesce(max(p.year * 12 + (p.month - 1)), -1) as k from periods p
+     where not (p.month = $1 and p.year = $2)
+       and (exists (select 1 from period_imports i where i.period_id = p.id and i.district_id = $3)
+         or exists (select 1 from contributions c join branches b on b.id = c.branch_id
+                    where c.period_id = p.id and b.district_id = $3))`,
+    [month, year, districtId]
   )).rows[0];
   const isLatest = periodKey >= Number(maxOther.k);
   summary.isLatest = isLatest;
-
-  const { districtId } = await ensureZoneDistrict(client, summary);
 
   const ids = [...seen];
   const existingMembers = new Map((await client.query(
@@ -324,7 +337,7 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
   if (missingBranches.length) {
     const inserted = await client.query(
       `insert into branches (code, name, district_id)
-       select name, name, $2 from jsonb_array_elements_text($1::jsonb) as input(name)
+        select $2::text || ':' || name, name, $2::integer from jsonb_array_elements_text($1::jsonb) as input(name)
        returning id, name`,
       [JSON.stringify(missingBranches), districtId]
     );
@@ -421,7 +434,11 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
      where $2::boolean`,
     [payload, isLatest]
   );
-  await client.query('delete from contributions where period_id = $1', [period.id]);
+  await client.query(
+    `delete from contributions where period_id = $1
+       and branch_id in (select id from branches where district_id = $2)`,
+    [period.id, districtId]
+  );
   await client.query(
     `insert into contributions (period_id, member_id, branch_id, category_id, amount, received, flag, remarks, entry_date)
      select $2, m.id, input.branch_id, input.category_id, input.amount,
@@ -448,6 +465,13 @@ async function runIngest(client, { month, year, rows, markLeft = true }) {
   }
 
   summary.periodId = period.id;
+  await client.query(
+    `insert into period_imports (period_id, district_id, import_hash, import_summary)
+     values ($1, $2, $3, $4::jsonb)
+     on conflict (period_id, district_id) do update set
+       import_hash = excluded.import_hash, import_summary = excluded.import_summary`,
+    [period.id, districtId, hash, JSON.stringify(summary)]
+  );
   await client.query(
     'update periods set import_hash = $1, import_summary = $2::jsonb where id = $3',
     [hash, JSON.stringify(summary), period.id]

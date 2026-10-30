@@ -54,6 +54,7 @@ router.post(
         }
         periodId = existing.rows[0].id;
         await client.query('delete from contributions where period_id = $1', [periodId]);
+        await client.query('delete from period_imports where period_id = $1', [periodId]);
         await client.query(
           'update periods set generated_at = now(), import_hash = null, import_summary = null where id = $1',
           [periodId]

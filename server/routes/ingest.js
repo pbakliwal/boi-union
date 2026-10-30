@@ -42,7 +42,11 @@ router.post(
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const summary = await runIngest(client, { month, year, rows });
+      const summary = await runIngest(client, {
+        month, year, rows,
+        zoneName: req.body.zoneName,
+        districtName: req.body.districtName,
+      });
       if (commit) await client.query('COMMIT');
       else await client.query('ROLLBACK');
       res.json({ dryRun: !commit, parsedRows: rows.length, ...summary });

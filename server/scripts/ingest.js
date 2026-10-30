@@ -29,7 +29,7 @@ function inferFromName(file) {
 async function main() {
   const file = process.argv[2];
   if (!file || file.startsWith('--')) {
-    console.error('Usage: node scripts/ingest.js <file.csv|.xlsx> [--month M --year Y] [--reset] [--dry]');
+    console.error('Usage: node scripts/ingest.js <file.csv|.xlsx> [--month M --year Y] [--zone NAME --district NAME] [--reset] [--dry]');
     process.exit(1);
   }
   const inferred = inferFromName(file);
@@ -53,7 +53,11 @@ async function main() {
       await client.query('truncate contributions, periods, rates, members, branches, districts, zones, categories restart identity cascade');
       console.log('Wiped existing masters + contributions.');
     }
-    const summary = await runIngest(client, { month, year, rows });
+    const summary = await runIngest(client, {
+      month, year, rows,
+      zoneName: arg('--zone') || 'Indore',
+      districtName: arg('--district') || arg('--zone') || 'Indore',
+    });
     if (has('--dry')) {
       await client.query('ROLLBACK');
       console.log('DRY RUN — rolled back.');
