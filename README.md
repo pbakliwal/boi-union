@@ -37,6 +37,10 @@ account or removing/demoting the last remaining admin.
 
 ## Prerequisites
 
+**Windows local setup:** use the [PowerShell launcher and Windows guide](deploy/WINDOWS_LOCAL.md)
+to run PostgreSQL, the API and the frontend with Docker Desktop. No host Node.js or
+PostgreSQL installation is needed for that option. The manual setup below remains supported.
+
 - Node.js 18+
 - PostgreSQL 13+ (a database you can connect to)
 

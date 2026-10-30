@@ -1,0 +1,10 @@
+.git
+.claude
+.scout
+.env*
+**/.env*
+**/node_modules
+**/dist
+**/*.log
+data
+backups
