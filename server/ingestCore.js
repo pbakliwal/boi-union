@@ -1,7 +1,7 @@
 'use strict';
 
 // Parse a Bank-of-India "salary register deductions" file (CSV or Excel) and
-// sync it into the DB: upsert masters (Indore zone/district, branches, scale
+// sync it into the DB: upsert masters (selected zone, file districts, branches, scale
 // categories), upsert employees, mark absent employees as left, and build the
 // month's DRAFT contributions with anomaly flags. Shared by the CLI
 // (scripts/ingest.js) and the upload endpoint (routes/ingest.js).
@@ -16,7 +16,6 @@ const XLSX = require('xlsx');
 const { createHash } = require('crypto');
 
 const ZONE_NAME = 'Indore';
-const DISTRICT_NAME = 'Indore';
 
 // Serial-number column labels identify header-like rows in the export.
 const SN_TOKENS = new Set(['SN', 'SNO', 'S.NO', 'S NO', 'SR', 'SR.NO', 'SRNO', 'SL NO', 'SL.NO', 'SLNO', 'S/N', '#']);
@@ -24,6 +23,7 @@ const EMP_ID_ALIASES = ['EMPLOYEE ID', 'EMP ID'];
 const EMP_NAME_ALIASES = ['EMPLOYEE NAME', 'NAME', 'EMP NAME'];
 const LOCATION_ALIASES = ['LOCATION DESCRIPTION', 'LOC_DESCR', 'LOCATION', 'BRANCH'];
 const SCALE_ALIASES = ['SCALE', 'GRADE'];
+const DISTRICT_ALIASES = ['DISTRICT'];
 
 // Columns that are NOT union buckets (everything else in the header is).
 const META_COLUMNS = new Set([
@@ -31,7 +31,7 @@ const META_COLUMNS = new Set([
   'EMPLOYEE ID', 'EMP ID', 'EMPLOYEE NAME', 'NAME', 'EMP NAME',
   'MOB', 'MOBILE', 'PHONE',
   'LOC_DESCR', 'LOCATION DESCRIPTION', 'LOCATION', 'BRANCH',
-  'DEPARTMENT', 'DEPT', 'DESIGNATION', 'SCALE', 'GRADE',
+  'DEPARTMENT', 'DEPT', 'DESIGNATION', 'SCALE', 'GRADE', ...DISTRICT_ALIASES,
   'DOB', 'DOJ', 'GENDER', 'SEX', 'TOTAL', 'NIL',
 ]);
 
@@ -130,7 +130,7 @@ function parseUnionCsv(text) {
   const headerRows = allCells.slice(0, 5);
   let headerIdx = headerRows.findIndex((cells) => {
     const names = cells.map((cell) => String(cell || '').trim().toUpperCase());
-    return [EMP_ID_ALIASES, EMP_NAME_ALIASES, LOCATION_ALIASES, SCALE_ALIASES]
+    return [EMP_ID_ALIASES, EMP_NAME_ALIASES, LOCATION_ALIASES, SCALE_ALIASES, DISTRICT_ALIASES]
       .every((aliases) => aliases.some((name) => names.includes(name))) &&
       names.some((name) => name && !META_COLUMNS.has(name));
   });
@@ -152,10 +152,11 @@ function parseUnionCsv(text) {
   const idGender = firstIndex(col, ['GENDER', 'SEX']);
   const idLoc = firstIndex(col, LOCATION_ALIASES);
   const idScale = firstIndex(col, SCALE_ALIASES);
+  const idDistrict = firstIndex(col, DISTRICT_ALIASES);
   const idDoj = firstIndex(col, ['DOJ']);
   const idMobile = firstIndex(col, ['MOB', 'MOBILE', 'PHONE']);
-  if ([idEmp, idName, idLoc, idScale].some((x) => x === undefined)) {
-    const err = new Error('Header is missing required columns (EMPLOYEE ID, NAME, LOCATION, SCALE).');
+  if ([idEmp, idName, idLoc, idScale, idDistrict].some((x) => x === undefined)) {
+    const err = new Error('Header is missing required columns (EMPLOYEE ID, NAME, LOCATION, SCALE, DISTRICT).');
     err.status = 400;
     throw err;
   }
@@ -178,6 +179,12 @@ function parseUnionCsv(text) {
     const empId = String(cells[idEmp] || '').trim();
     if (empId.toUpperCase() === 'TOTAL') break;
     if (!/^\d+$/.test(empId)) continue; // skip non-data lines (SN totals, blanks)
+    const district = String(cells[idDistrict] || '').replace(/\s+/g, ' ').trim();
+    if (!district) {
+      const err = new Error(`Employee ${empId} on row ${li + 1} has no DISTRICT. Fill in the district before importing.`);
+      err.status = 400;
+      throw err;
+    }
 
     let amount = 0;
     let unionLabel = null;
@@ -194,6 +201,7 @@ function parseUnionCsv(text) {
       name: cleanName(cells[idName]),
       sex: gender === 'M' || gender === 'F' ? gender : null,
       branch: String(cells[idLoc] || '').trim(),
+      district,
       scale: String(cells[idScale] || '').trim().toUpperCase(),
       joined_on: idDoj !== undefined ? parseDate(cells[idDoj]) : null,
       mobile: idMobile !== undefined ? cleanMobile(cells[idMobile]) : null,
@@ -232,22 +240,17 @@ function parseUnionWorkbook(buffer) {
 
 // --- Ingest --------------------------------------------------------------
 
-async function ensureZoneDistrict(client, summary, zoneName, districtName) {
+async function ensureZone(client, summary, zoneName) {
   let z = (await client.query('select id from zones where lower(name) = lower($1)', [zoneName])).rows[0];
   if (!z) {
     z = (await client.query('insert into zones (code, name) values ($1, $2) returning id', [zoneName.toUpperCase(), zoneName])).rows[0];
     summary.masters.zonesCreated++;
   }
-  let d = (await client.query('select id from districts where lower(name) = lower($1) and zone_id = $2', [districtName, z.id])).rows[0];
-  if (!d) {
-    d = (await client.query('insert into districts (code, name, zone_id) values ($1, $2, $3) returning id', [`${z.id}:${districtName.toUpperCase()}`, districtName, z.id])).rows[0];
-    summary.masters.districtsCreated++;
-  }
-  return { zoneId: z.id, districtId: d.id };
+  return z.id;
 }
 
 // Main entry. Caller owns the transaction (client). month/year are the period.
-async function runIngest(client, { month, year, rows, markLeft = true, zoneName = ZONE_NAME, districtName = DISTRICT_NAME }) {
+async function runIngest(client, { month, year, rows, markLeft = true, zoneName = ZONE_NAME }) {
   const invalid = (message) => {
     const err = new Error(message);
     err.status = 400;
@@ -257,16 +260,21 @@ async function runIngest(client, { month, year, rows, markLeft = true, zoneName 
       !Number.isInteger(year) || year < 2000 || year > 2100) {
     invalid('Import month/year is out of range.');
   }
-  if (typeof zoneName !== 'string' || !zoneName.trim() ||
-      typeof districtName !== 'string' || !districtName.trim()) {
-    invalid('Import zone and district names are required.');
+  if (typeof zoneName !== 'string' || !zoneName.trim()) {
+    invalid('Import zone name is required.');
   }
   zoneName = zoneName.trim();
-  districtName = districtName.trim();
+  const nameKey = (name) => name.replace(/\s+/g, ' ').trim().toLowerCase();
+  const districtNames = new Map();
   if (!rows.length) invalid('No employee rows found in the file.');
   const seen = new Set();
   for (const row of rows) {
     if (!row.employee_id || !row.branch) invalid(`Employee ${row.employee_id || '(missing ID)'} has no ID or branch.`);
+    if (typeof row.district !== 'string' || !row.district.trim()) {
+      invalid(`Employee ${row.employee_id} has no DISTRICT. Fill in the district before importing.`);
+    }
+    const districtKey = nameKey(row.district);
+    if (!districtNames.has(districtKey)) districtNames.set(districtKey, row.district.replace(/\s+/g, ' ').trim());
     if (seen.has(row.employee_id)) invalid(`Duplicate Employee ID ${row.employee_id} in the file. Remove the duplicate row before importing.`);
     if (!Number.isFinite(row.amount) || row.amount < 0 || row.amount > 9999999999.99) {
       invalid(`Invalid deduction amount for employee ${row.employee_id}.`);
@@ -292,20 +300,20 @@ async function runIngest(client, { month, year, rows, markLeft = true, zoneName 
   )).rows[0];
 
   const summary = {
-    month, year, zoneName, districtName,
+    month, year, zoneName, districtNames: [...districtNames.values()],
     isLatest: true,
     masters: { zonesCreated: 0, districtsCreated: 0, branchesCreated: 0, categoriesCreated: 0 },
     employees: { created: 0, updated: 0, unchanged: 0, markedLeft: 0 },
     contributions: { total: 0, totalAmount: 0, flaggedZero: 0, flaggedDiffers: 0 },
     flagged: [],
   };
-  const { districtId } = await ensureZoneDistrict(client, summary, zoneName, districtName);
+  const zoneId = await ensureZone(client, summary, zoneName);
   const receipt = (await client.query(
-    'select import_hash, import_summary from period_imports where period_id = $1 and district_id = $2',
-    [period.id, districtId]
+    'select import_hash, import_summary from period_imports where period_id = $1 and zone_id = $2',
+    [period.id, zoneId]
   )).rows[0];
   if (receipt?.import_hash === hash && receipt.import_summary) {
-    return { ...receipt.import_summary, zoneName, districtName, alreadyApplied: true };
+    return { ...receipt.import_summary, zoneName, alreadyApplied: true };
   }
   if (period.status === 'final') invalid(`${month}/${year} is finalized — reopen it before re-importing.`);
 
@@ -317,10 +325,11 @@ async function runIngest(client, { month, year, rows, markLeft = true, zoneName 
   const maxOther = (await client.query(
     `select coalesce(max(p.year * 12 + (p.month - 1)), -1) as k from periods p
      where not (p.month = $1 and p.year = $2)
-       and (exists (select 1 from period_imports i where i.period_id = p.id and i.district_id = $3)
+       and (exists (select 1 from period_imports i where i.period_id = p.id and i.zone_id = $3)
          or exists (select 1 from contributions c join branches b on b.id = c.branch_id
-                    where c.period_id = p.id and b.district_id = $3))`,
-    [month, year, districtId]
+                    join districts d on d.id = b.district_id
+                    where c.period_id = p.id and d.zone_id = $3))`,
+    [month, year, zoneId]
   )).rows[0];
   const isLatest = periodKey >= Number(maxOther.k);
   summary.isLatest = isLatest;
@@ -330,19 +339,45 @@ async function runIngest(client, { month, year, rows, markLeft = true, zoneName 
     'select id, employee_id, category_id from members where employee_id = any($1::text[])',
     [ids]
   )).rows.map((m) => [m.employee_id, m]));
+  const districtCache = new Map((await client.query(
+    'select id, name from districts where zone_id = $1', [zoneId]
+  )).rows.map((d) => [nameKey(d.name), d.id]));
+  const missingDistricts = [...districtNames].filter(([key]) => !districtCache.has(key)).map(([, name]) => name);
+  if (missingDistricts.length) {
+    const inserted = await client.query(
+      `insert into districts (code, name, zone_id)
+       select $2::text || ':' || upper(name), name, $2::integer
+       from jsonb_array_elements_text($1::jsonb) as input(name)
+       returning id, name`,
+      [JSON.stringify(missingDistricts), zoneId]
+    );
+    summary.masters.districtsCreated = inserted.rowCount;
+    inserted.rows.forEach((d) => districtCache.set(nameKey(d.name), d.id));
+  }
+  const branchKey = (districtId, name) => JSON.stringify([districtId, nameKey(name)]);
   const branchCache = new Map((await client.query(
-    'select id, name from branches where district_id = $1', [districtId]
-  )).rows.map((b) => [b.name, b.id]));
-  const missingBranches = [...new Set(rows.map((r) => r.branch))].filter((name) => !branchCache.has(name));
+    `select b.id, b.name, b.district_id from branches b
+     join districts d on d.id = b.district_id where d.zone_id = $1`, [zoneId]
+  )).rows.map((b) => [branchKey(b.district_id, b.name), b.id]));
+  const missingBranchesByKey = new Map();
+  for (const row of rows) {
+    const districtId = districtCache.get(nameKey(row.district));
+    const key = branchKey(districtId, row.branch);
+    if (!branchCache.has(key) && !missingBranchesByKey.has(key)) {
+      missingBranchesByKey.set(key, { name: row.branch.trim(), district_id: districtId });
+    }
+  }
+  const missingBranches = [...missingBranchesByKey.values()];
   if (missingBranches.length) {
     const inserted = await client.query(
       `insert into branches (code, name, district_id)
-        select $2::text || ':' || name, name, $2::integer from jsonb_array_elements_text($1::jsonb) as input(name)
-       returning id, name`,
-      [JSON.stringify(missingBranches), districtId]
+       select district_id::text || ':' || name, name, district_id
+       from jsonb_to_recordset($1::jsonb) as input(name text, district_id integer)
+       returning id, name, district_id`,
+      [JSON.stringify(missingBranches)]
     );
     summary.masters.branchesCreated = inserted.rowCount;
-    inserted.rows.forEach((b) => branchCache.set(b.name, b.id));
+    inserted.rows.forEach((b) => branchCache.set(branchKey(b.district_id, b.name), b.id));
   }
 
   const catCache = new Map((await client.query('select id, code from categories')).rows.map((c) => [c.code.toUpperCase(), c.id]));
@@ -411,13 +446,14 @@ async function runIngest(client, { month, year, rows, markLeft = true, zoneName 
     if (flag === 'zero') notes.push('no deduction');
     const remarks = notes.join('; ') || null;
 
-    entries.push({ ...r, category_id: catId, branch_id: branchCache.get(r.branch), flag, remarks });
+    const districtId = districtCache.get(nameKey(r.district));
+    entries.push({ ...r, category_id: catId, branch_id: branchCache.get(branchKey(districtId, r.branch)), flag, remarks });
 
     summary.contributions.total++;
     if (r.amount > 0) summary.contributions.totalAmount += r.amount;
     if (flag === 'zero') summary.contributions.flaggedZero++;
     if (flag === 'differs') summary.contributions.flaggedDiffers++;
-    if (flag) summary.flagged.push({ employee_id: r.employee_id, name: r.name, branch: r.branch, scale: r.scale, amount: r.amount, expected, flag });
+    if (flag) summary.flagged.push({ employee_id: r.employee_id, name: r.name, district: r.district, branch: r.branch, scale: r.scale, amount: r.amount, expected, flag });
   }
 
   const payload = JSON.stringify(entries);
@@ -436,8 +472,8 @@ async function runIngest(client, { month, year, rows, markLeft = true, zoneName 
   );
   await client.query(
     `delete from contributions where period_id = $1
-       and branch_id in (select id from branches where district_id = $2)`,
-    [period.id, districtId]
+       and branch_id in (select b.id from branches b join districts d on d.id = b.district_id where d.zone_id = $2)`,
+    [period.id, zoneId]
   );
   await client.query(
     `insert into contributions (period_id, member_id, branch_id, category_id, amount, received, flag, remarks, entry_date)
@@ -452,25 +488,26 @@ async function runIngest(client, { month, year, rows, markLeft = true, zoneName 
     [payload, period.id, periodStart]
   );
 
-  // Mark employees in this district who are absent from the file as left —
+  // Mark employees in this zone who are absent from the file as left —
   // only when importing the latest month (never on a back-fill).
   if (markLeft && isLatest) {
     const res = await client.query(
       `update members set active=false, left_on=$1
-       where active=true and branch_id in (select id from branches where district_id=$2)
+       where active=true and branch_id in (
+         select b.id from branches b join districts d on d.id = b.district_id where d.zone_id=$2)
          and not (employee_id = any($3::text[]))`,
-      [periodEnd, districtId, ids]
+      [periodEnd, zoneId, ids]
     );
     summary.employees.markedLeft = res.rowCount;
   }
 
   summary.periodId = period.id;
   await client.query(
-    `insert into period_imports (period_id, district_id, import_hash, import_summary)
+    `insert into period_imports (period_id, zone_id, import_hash, import_summary)
      values ($1, $2, $3, $4::jsonb)
-     on conflict (period_id, district_id) do update set
+     on conflict (period_id, zone_id) do update set
        import_hash = excluded.import_hash, import_summary = excluded.import_summary`,
-    [period.id, districtId, hash, JSON.stringify(summary)]
+    [period.id, zoneId, hash, JSON.stringify(summary)]
   );
   await client.query(
     'update periods set import_hash = $1, import_summary = $2::jsonb where id = $3',

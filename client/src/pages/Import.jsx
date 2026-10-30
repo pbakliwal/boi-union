@@ -32,13 +32,11 @@ export default function Import() {
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [year, setYear] = useState(CURRENT_YEAR);
   const [zoneName, setZoneName] = useState('');
-  const [districtName, setDistrictName] = useState('');
   const [preview, setPreview] = useState(null);
   const [applied, setApplied] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const zones = useFetch(isAdmin ? '/api/zones' : null);
-  const districts = useFetch(isAdmin ? '/api/districts' : null);
 
   if (!isAdmin) return <div className="empty">Admins only.</div>;
 
@@ -66,19 +64,18 @@ export default function Import() {
     setError(null);
     setApplied(null);
     try {
-      const body = { month, year, zoneName, districtName, commit, ...(xlsx ? { xlsx } : { csv }) };
+      const body = { month, year, zoneName, commit, ...(xlsx ? { xlsx } : { csv }) };
       const res = await api.post('/api/ingest', body);
       if (commit) {
         setApplied(res);
         setPreview(null);
         zones.reload();
-        districts.reload();
       } else {
         setPreview(res);
       }
     } catch (e) {
       setError(commit
-        ? `${e.message} Retry Apply import with the same file, month and district. Failed transactions leave no partial data; completed imports are detected automatically.`
+        ? `${e.message} Retry Apply import with the same file, month and zone. Failed transactions leave no partial data; completed imports are detected automatically.`
         : e.message);
     } finally {
       setBusy(false);
@@ -116,22 +113,16 @@ export default function Import() {
           </div>
           <div className="field">
             <label htmlFor="import-zone">Zone</label>
-            <input id="import-zone" type="text" list="import-zones" required disabled={busy} value={zoneName} onChange={(e) => { setZoneName(e.target.value); setDistrictName(''); setPreview(null); setApplied(null); }} />
+            <input id="import-zone" type="text" list="import-zones" required disabled={busy} value={zoneName} onChange={(e) => { setZoneName(e.target.value); setPreview(null); setApplied(null); }} />
             <datalist id="import-zones">
               {(zones.data || []).map((zone) => <option key={zone.id} value={zone.name} />)}
             </datalist>
           </div>
-          <div className="field">
-            <label htmlFor="import-district">District</label>
-            <input id="import-district" type="text" list="import-districts" required disabled={busy || !zoneName.trim()} value={districtName} onChange={(e) => { setDistrictName(e.target.value); setPreview(null); setApplied(null); }} />
-            <datalist id="import-districts">
-              {(districts.data || []).filter((district) => district.zone_name.toLowerCase() === zoneName.trim().toLowerCase()).map((district) => <option key={district.id} value={district.name} />)}
-            </datalist>
-          </div>
-          <button className="btn" disabled={(!csv && !xlsx) || !zoneName.trim() || !districtName.trim() || busy} onClick={() => run(false)}>
+          <button className="btn" disabled={(!csv && !xlsx) || !zoneName.trim() || busy} onClick={() => run(false)}>
             {busy ? 'Working…' : 'Preview'}
           </button>
         </div>
+        <p className="muted">Upload the complete zone roster with a DISTRICT column for every employee. Districts and branches are created from the file. A changed file replaces this zone's draft contributions for the selected month.</p>
         {filename && <div className="muted">{filename} — importing into {monthName(month)} {year}</div>}
         {error && <div className="error">{error}</div>}
       </div>
@@ -161,13 +152,14 @@ export default function Import() {
               <div className="table-wrap" style={{ maxHeight: 320 }}>
                 <table className="data">
                   <thead>
-                    <tr><th>Emp ID</th><th>Name</th><th>Branch</th><th>Scale</th><th className="num">Amount</th><th className="num">Expected</th><th>Flag</th></tr>
+                    <tr><th>Emp ID</th><th>Name</th><th>District</th><th>Branch</th><th>Scale</th><th className="num">Amount</th><th className="num">Expected</th><th>Flag</th></tr>
                   </thead>
                   <tbody>
                     {preview.flagged.map((r) => (
                       <tr key={r.employee_id} className="flag-row">
                         <td>{r.employee_id}</td>
                         <td>{r.name}</td>
+                        <td>{r.district}</td>
                         <td>{r.branch}</td>
                         <td>{r.scale}</td>
                         <td className="num">{money(r.amount)}</td>
@@ -216,7 +208,7 @@ function AppliedFlagged({ summary }) {
         <div className="table-wrap" style={{ maxHeight: 400, marginTop: 8 }}>
           <table className="data">
             <thead>
-              <tr><th>Emp ID</th><th>Name</th><th>Branch</th><th>Scale</th><th className="num">Amount</th><th className="num">Expected</th><th>Flag</th><th>Received</th><th>Action</th></tr>
+              <tr><th>Emp ID</th><th>Name</th><th>District</th><th>Branch</th><th>Scale</th><th className="num">Amount</th><th className="num">Expected</th><th>Flag</th><th>Received</th><th>Action</th></tr>
             </thead>
             <tbody>
               {rows.map((row) => (
@@ -227,7 +219,7 @@ function AppliedFlagged({ summary }) {
                   onSave={save}
                 />
               ))}
-              {rows.length === 0 && <tr><td colSpan={9} className="empty">No flagged entries.</td></tr>}
+              {rows.length === 0 && <tr><td colSpan={10} className="empty">No flagged entries.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -272,6 +264,7 @@ function FlaggedEditor({ row, expected, onSave }) {
     <tr className="flag-row">
       <td>{row.employee_id}</td>
       <td>{row.name} {row.surname}</td>
+      <td>{row.district_name}</td>
       <td>{row.branch_name}</td>
       <td>{row.category_code}</td>
       <td className="num">
@@ -317,17 +310,17 @@ function Summary({ s }) {
   );
   return (
     <>
-      <div style={{ margin: '6px 0' }}><strong>{s.zoneName}</strong> / {s.districtName}</div>
+      <div style={{ margin: '6px 0' }}><strong>{s.zoneName}</strong> — Districts: {s.districtNames.join(', ')}</div>
       {s.alreadyApplied && (
         <p className="muted">
           Showing the saved receipt for this file. No records were rewritten and manual corrections
-          were preserved. A changed file replaces this district's draft; Generate or Delete clears this receipt.
+          were preserved. A changed file replaces this zone's draft; Generate or Delete clears this receipt.
         </p>
       )}
       {s.isLatest === false && (
         <div className="muted" style={{ margin: '6px 0' }}>
-          ↩ Older month than this district's latest on record — master roster is left untouched; only this
-          district's contributions are written.
+          ↩ Older month than this zone's latest on record — master roster is left untouched; only this
+          zone's contributions are written.
         </div>
       )}
       <div style={{ display: 'flex', gap: 26, flexWrap: 'wrap', margin: '10px 0' }}>
@@ -335,6 +328,7 @@ function Summary({ s }) {
         {stat('Updated', s.employees.updated)}
         {stat('Unchanged', s.employees.unchanged)}
         {stat('Marked left', s.employees.markedLeft, s.employees.markedLeft ? 'var(--danger)' : undefined)}
+        {stat('New districts', s.masters.districtsCreated)}
         {stat('New branches', s.masters.branchesCreated)}
         {stat('New categories', s.masters.categoriesCreated)}
         {stat('Contributions', s.contributions.total)}

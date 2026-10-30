@@ -15,6 +15,7 @@ function makeRows(count = 500) {
     name: `Member ${i}`,
     sex: i % 2 ? 'F' : 'M',
     branch: `Branch ${i % 87}`,
+    district: 'Indore',
     scale: ['CK1', 'CK2', 'SS1', 'SS2'][i % 4],
     joined_on: '2020-01-01',
     mobile: `90000${String(i).padStart(5, '0')}`,
@@ -37,15 +38,19 @@ test('rejects duplicate IDs and invalid input before any writes', async () => {
     month: 5, year: 2026, rows: [{ ...rows[0], amount: Infinity }],
   }), /Invalid deduction amount/);
   await assert.rejects(runIngest(client, { month: 13, year: 2026, rows }), /out of range/);
-  await assert.rejects(runIngest(client, { month: 5, year: 2026, rows, zoneName: ' ' }), /zone and district names/);
-  await assert.rejects(runIngest(client, { month: 5, year: 2026, rows, districtName: null }), /zone and district names/);
+  await assert.rejects(runIngest(client, { month: 5, year: 2026, rows, zoneName: ' ' }), /zone name/);
+  for (const district of [undefined, null, '', '  ']) {
+    await assert.rejects(runIngest(client, {
+      month: 5, year: 2026, rows: [{ ...rows[0], district }],
+    }), /Employee 100000 has no DISTRICT/);
+  }
 });
 
 test('CSV and Excel retain the same normalized import shape', () => {
   const cells = [
-    ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1'],
-    ['100000', 'Member Zero', 'Branch 0', 'CK1', 0],
-    ['100001', 'Member One', 'Branch 1', 'SS1', 50],
+    ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1', 'DISTRICT'],
+    ['100000', 'Member Zero', 'Branch 0', 'CK1', 0, 'Indore'],
+    ['100001', 'Member One', 'Branch 1', 'SS1', 50, 'Dewas'],
   ];
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(cells), 'Register');
@@ -57,11 +62,11 @@ test('CSV and Excel retain the same normalized import shape', () => {
 test('CSV and Excel exclude SNO serial numbers from contribution amounts', () => {
   const cells = [
     ['AWARD STAFF CONTRIBUTION - BHOPAL ZONE - APRIL 2026'],
-    ['SNO', 'EMPLOYEE ID', 'EMPLOYEE NAME', 'DESIGNATION', 'LOCATION DESCRIPTION', 'SCALE', 'UNION CODE-BHOPAL', 'UNION CODE-INDORE ZONE 1', 'TOTAL'],
-    [1, '100000', 'Member One', 'CUSTOMER SERVICE ASSOCIATE', 'AHMEDPUR', 'CK1', 100, 0, 100],
-    [6, '100001', 'Member Two', 'CASH PEON', 'AIRPORT ROAD', 'SS1', 50, 0, 50],
-    [20, '100002', 'Member Three', 'ARMED GUARD', 'ARERA COLONY', 'SS2', 0, 0, 0],
-    [30, '100003', 'Member Four', 'CUSTOMER SERVICE ASSOCIATE', 'AHMEDPUR', 'CK1', 60, 20, 80],
+    ['SNO', 'EMPLOYEE ID', 'EMPLOYEE NAME', 'DESIGNATION', 'LOCATION DESCRIPTION', 'SCALE', 'UNION CODE-BHOPAL', 'UNION CODE-INDORE ZONE 1', 'TOTAL', 'DISTRICT'],
+    [1, '100000', 'Member One', 'CUSTOMER SERVICE ASSOCIATE', 'AHMEDPUR', 'CK1', 100, 0, 100, 'Sehore'],
+    [6, '100001', 'Member Two', 'CASH PEON', 'AIRPORT ROAD', 'SS1', 50, 0, 50, 'Bhopal'],
+    [20, '100002', 'Member Three', 'ARMED GUARD', 'ARERA COLONY', 'SS2', 0, 0, 0, 'Bhopal'],
+    [30, '100003', 'Member Four', 'CUSTOMER SERVICE ASSOCIATE', 'AHMEDPUR', 'CK1', 60, 20, 80, 'Sehore'],
   ];
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(cells), 'union');
@@ -70,14 +75,15 @@ test('CSV and Excel exclude SNO serial numbers from contribution amounts', () =>
   const parsed = parseUnionCsv(csv);
   assert.deepEqual(parsed.unionCols, ['BHOPAL', 'INDORE ZONE 1']);
   assert.deepEqual(parsed.rows.map((row) => row.amount), [100, 50, 0, 80]);
+  assert.deepEqual(parsed.rows.map((row) => row.district), ['Sehore', 'Bhopal', 'Bhopal', 'Sehore']);
   assert.deepEqual(parseUnionWorkbook(excel), parsed);
 });
 
 test('CSV and Excel find a complete header within the first five rows', async (context) => {
   const data = [
-    ['S.NO', 'EMP ID', 'EMP NAME', 'LOCATION', 'GRADE', 'UNION CODE-INDORE ZONE 1'],
-    [1, '100000', 'Member Zero', 'Branch 0', 'CK1', 0],
-    [2, '100001', 'Member One', 'Branch 1', 'SS1', 50],
+    ['S.NO', 'EMP ID', 'EMP NAME', 'LOCATION', 'GRADE', 'UNION CODE-INDORE ZONE 1', 'DISTRICT'],
+    [1, '100000', 'Member Zero', 'Branch 0', 'CK1', 0, 'Indore'],
+    [2, '100001', 'Member One', 'Branch 1', 'SS1', 50, 'Indore'],
   ];
   const expected = parseUnionCsv(data.map((row) => row.join(',')).join('\n'));
   const preamble = [
@@ -104,16 +110,16 @@ test('CSV and Excel report header errors only after checking the first five rows
     {
       cells: [
         ...Array.from({ length: 5 }, () => ['Salary register heading']),
-        ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1'],
-        ['100000', 'Member Zero', 'Branch 0', 'CK1', 100],
+        ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1', 'DISTRICT'],
+        ['100000', 'Member Zero', 'Branch 0', 'CK1', 100, 'Indore'],
       ],
       message: /first 5 rows/,
     },
     {
       cells: [
         ...Array.from({ length: 5 }, () => []),
-        ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1'],
-        ['100000', 'Member Zero', 'Branch 0', 'CK1', 100],
+        ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'INDORE ZONE 1', 'DISTRICT'],
+        ['100000', 'Member Zero', 'Branch 0', 'CK1', 100, 'Indore'],
       ],
       message: /first 5 rows/,
     },
@@ -122,7 +128,7 @@ test('CSV and Excel report header errors only after checking the first five rows
       message: /Header is missing required columns/,
     },
     {
-      cells: [['Salary register'], ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE']],
+      cells: [['Salary register'], ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'DISTRICT']],
       message: /No union\/deduction columns/,
     },
   ];
@@ -134,6 +140,48 @@ test('CSV and Excel report header errors only after checking the first five rows
     const matches = (error) => error.status === 400 && message.test(error.message);
     assert.throws(() => parseUnionCsv(csv), matches);
     assert.throws(() => parseUnionWorkbook(excel), matches);
+  }
+});
+
+test('CSV and Excel require DISTRICT and never treat it as a deduction', () => {
+  const cases = [
+    {
+      cells: [
+        ['EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'UNION'],
+        ['100000', 'Member', 'Branch', 'CK1', 100],
+      ],
+      message: /missing required columns.*DISTRICT/,
+    },
+    {
+      cells: [
+        ['DISTRICT', 'EMPLOYEE ID', 'NAME', 'BRANCH', 'SCALE', 'UNION'],
+        [' ', '100000', 'Member', 'Branch', 'CK1', 100],
+      ],
+      message: /Employee 100000 on row 2 has no DISTRICT/,
+    },
+  ];
+  for (const { cells, message } of cases) {
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(cells), 'Register');
+    const csv = cells.map((row) => row.join(',')).join('\n');
+    const matches = (error) => error.status === 400 && message.test(error.message);
+    assert.throws(() => parseUnionCsv(csv), matches);
+    for (const bookType of ['xlsx', 'xls']) {
+      assert.throws(() => parseUnionWorkbook(XLSX.write(workbook, { type: 'buffer', bookType })), matches);
+    }
+  }
+  const cells = [
+    [' district ', 'GRADE', 'EMP ID', 'LOCATION', 'EMP NAME', 'UNION CODE-BHOPAL'],
+    ['  Sehore  ', 'CK1', '100000', 'Branch', 'Member', 100],
+    ['123', 'SS1', '100001', 'Branch', 'Member Two', 50],
+  ];
+  const parsed = parseUnionCsv(cells.map((row) => row.join(',')).join('\n'));
+  assert.deepEqual(parsed.unionCols, ['BHOPAL']);
+  assert.deepEqual(parsed.rows.map((row) => [row.district, row.amount]), [['Sehore', 100], ['123', 50]]);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(cells), 'Register');
+  for (const bookType of ['xlsx', 'xls']) {
+    assert.deepEqual(parseUnionWorkbook(XLSX.write(workbook, { type: 'buffer', bookType })), parsed);
   }
 });
 
@@ -208,7 +256,7 @@ test('bulk import PostgreSQL integration', {
       queries = 0;
       const retry = await transaction(() => runIngest(counted, { month: 5, year: 2026, rows }));
       assert.deepEqual(retry, { ...imported, alreadyApplied: true });
-      assert.equal(queries, 6);
+      assert.equal(queries, 5);
       assert.equal(await count('members'), 500);
       assert.deepEqual((await client.query('select id from contributions order by id')).rows, before);
       const corrected = (await client.query(
@@ -345,21 +393,37 @@ test('bulk import PostgreSQL integration', {
       assert.equal(await count('members'), 500);
     });
 
-    await t.test('district imports coexist and re-import only replaces the selected district', async () => {
+    await t.test('zone files create multiple districts and replacements leave other zones untouched', async () => {
       const indoreRows = [
         { ...rows[0], employee_id: '600000', amount: 100 },
         { ...rows[1], employee_id: '600001', amount: 50 },
       ];
       const bhopalRows = [
-        { ...rows[0], employee_id: '700000', amount: 100 },
-        { ...rows[1], employee_id: '700001', amount: 50 },
+        { ...rows[0], employee_id: '700000', district: 'Bhopal', branch: 'Shared Branch', amount: 100 },
+        { ...rows[1], employee_id: '700001', district: 'Sehore', branch: 'Shared Branch', amount: 50 },
+        { ...rows[2], employee_id: '700002', district: ' sehore ', branch: 'shared branch', amount: 100 },
       ];
       const indore = await transaction(() => runIngest(client, { month: 10, year: 2026, rows: indoreRows }));
       const bhopal = await transaction(() => runIngest(client, {
-        month: 10, year: 2026, rows: bhopalRows, zoneName: 'Bhopal', districtName: 'Bhopal',
+        month: 10, year: 2026, rows: bhopalRows, zoneName: 'Bhopal',
       }));
       assert.equal(bhopal.periodId, indore.periodId);
-      assert.equal((await client.query('select count(*)::int as n from contributions where period_id=$1', [indore.periodId])).rows[0].n, 4);
+      assert.equal(bhopal.masters.districtsCreated, 2);
+      assert.equal(bhopal.masters.branchesCreated, 2);
+      assert.deepEqual(bhopal.districtNames, ['Bhopal', 'Sehore']);
+      const hierarchy = (await client.query(
+        `select m.employee_id, b.id as branch_id, d.name as district, z.name as zone
+         from members m join branches b on b.id=m.branch_id
+         join districts d on d.id=b.district_id join zones z on z.id=d.zone_id
+         where m.employee_id=any($1::text[]) order by m.employee_id`,
+        [bhopalRows.map((r) => r.employee_id)]
+      )).rows;
+      assert.deepEqual(hierarchy.map((r) => [r.district, r.zone]), [
+        ['Bhopal', 'Bhopal'], ['Sehore', 'Bhopal'], ['Sehore', 'Bhopal'],
+      ]);
+      assert.notEqual(hierarchy[0].branch_id, hierarchy[1].branch_id);
+      assert.equal(hierarchy[1].branch_id, hierarchy[2].branch_id);
+      assert.equal((await client.query('select count(*)::int as n from contributions where period_id=$1', [indore.periodId])).rows[0].n, 5);
       assert.equal((await client.query('select count(*)::int as n from period_imports where period_id=$1', [indore.periodId])).rows[0].n, 2);
       await client.query(
         'update contributions set amount=125.50 where period_id=$1 and member_id=(select id from members where employee_id=$2)',
@@ -374,9 +438,9 @@ test('bulk import PostgreSQL integration', {
       )).rows;
       assert.equal(indoreBefore[0].amount, '125.50');
       const replacement = await transaction(() => runIngest(client, {
-        month: 10, year: 2026, rows: [{ ...bhopalRows[0], amount: 75 }], zoneName: 'Bhopal', districtName: 'Bhopal',
+        month: 10, year: 2026, rows: [{ ...bhopalRows[0], amount: 75 }], zoneName: 'Bhopal',
       }));
-      assert.equal(replacement.employees.markedLeft, 1);
+      assert.equal(replacement.employees.markedLeft, 2);
       const indoreAfter = (await client.query(
         `select c.id, m.employee_id, c.amount from contributions c join members m on m.id=c.member_id
          where c.period_id=$1 and m.employee_id=any($2::text[]) order by m.employee_id`,
@@ -386,29 +450,68 @@ test('bulk import PostgreSQL integration', {
       assert.equal((await client.query('select count(*)::int as n from contributions where period_id=$1', [indore.periodId])).rows[0].n, 3);
       assert.equal((await client.query("select bool_and(active) as active from members where employee_id in ('600000', '600001')")).rows[0].active, true);
       assert.equal((await client.query("select active from members where employee_id='700001'")).rows[0].active, false);
+      const replacementRows = [{ ...rows[0], employee_id: '900000', district: 'Indore' }];
       await transaction(() => runIngest(client, {
-        month: 10, year: 2026, rows: [{ ...rows[0], employee_id: '800000' }], zoneName: 'Bhopal', districtName: 'Sehore',
+        month: 10, year: 2026, rows: replacementRows, zoneName: 'Bhopal',
       }));
-      await transaction(() => runIngest(client, {
-        month: 10, year: 2026, rows: [{ ...rows[0], employee_id: '900000' }], zoneName: 'Bhopal', districtName: 'Indore',
-      }));
-      assert.equal((await client.query('select count(*)::int as n from contributions where period_id=$1', [indore.periodId])).rows[0].n, 5);
+      assert.equal((await client.query('select count(*)::int as n from contributions where period_id=$1', [indore.periodId])).rows[0].n, 3);
       assert.equal((await client.query("select count(*)::int as n from districts where name='Indore'")).rows[0].n, 2);
-      assert.equal((await client.query('select count(*)::int as n from period_imports where period_id=$1', [indore.periodId])).rows[0].n, 4);
+      assert.equal((await client.query('select count(*)::int as n from period_imports where period_id=$1', [indore.periodId])).rows[0].n, 2);
+      const replay = await transaction(() => runIngest(client, {
+        month: 10, year: 2026, rows: bhopalRows, zoneName: 'Bhopal',
+      }));
+      assert.equal(replay.alreadyApplied, undefined);
+      assert.equal(replay.contributions.total, 3);
+      assert.equal((await transaction(() => runIngest(client, {
+        month: 10, year: 2026, rows: bhopalRows, zoneName: 'Bhopal',
+      }))).alreadyApplied, true);
     });
 
-    await t.test('latest roster and backfills are independent for each district', async () => {
-      const scope = { zoneName: 'Ujjain', districtName: 'Ujjain' };
-      const firstRows = [{ ...rows[0], employee_id: '950000' }];
+    await t.test('latest roster is zone-wide and older files preserve district assignments', async () => {
+      const scope = { zoneName: 'Ujjain' };
+      const firstRows = [
+        { ...rows[0], employee_id: '950000', district: 'Ujjain' },
+        { ...rows[1], employee_id: '950001', district: 'Dewas' },
+      ];
       const first = await transaction(() => runIngest(client, { month: 4, year: 2026, rows: firstRows, ...scope }));
       assert.equal(first.isLatest, true);
-      const latestRows = [{ ...firstRows[0], name: 'Latest Ujjain Member' }];
+      const latestRows = [{ ...firstRows[0], name: 'Latest Ujjain Member', district: 'Dewas' }];
       await transaction(() => runIngest(client, { month: 5, year: 2026, rows: latestRows, ...scope }));
       const backfill = await transaction(() => runIngest(client, {
-        month: 4, year: 2026, rows: [{ ...firstRows[0], name: 'Older Ujjain Member', amount: 80 }], ...scope,
+        month: 4, year: 2026, rows: firstRows.map((row) => ({ ...row, name: 'Older Ujjain Member', amount: 80 })), ...scope,
       }));
       assert.equal(backfill.isLatest, false);
       assert.equal((await client.query("select name from members where employee_id='950000'")).rows[0].name, 'Latest Ujjain Member');
+      const current = (await client.query(
+        `select m.employee_id, m.active, d.name as district from members m
+         join branches b on b.id=m.branch_id join districts d on d.id=b.district_id
+         where m.employee_id in ('950000', '950001') order by m.employee_id`
+      )).rows;
+      assert.deepEqual(current, [
+        { employee_id: '950000', active: true, district: 'Dewas' },
+        { employee_id: '950001', active: false, district: 'Dewas' },
+      ]);
+      const history = (await client.query(
+        `select d.name as district from contributions c join branches b on b.id=c.branch_id
+         join districts d on d.id=b.district_id join members m on m.id=c.member_id
+         where c.period_id=$1 and m.employee_id='950000'`, [first.periodId]
+      )).rows[0];
+      assert.equal(history.district, 'Ujjain');
+    });
+
+    await t.test('500 employees across 50 districts still use at most 24 queries', async () => {
+      const manyDistricts = rows.map((row, i) => ({
+        ...row, employee_id: String(980000 + i), district: `District ${i % 50}`,
+      }));
+      queries = 0;
+      const result = await transaction(() => runIngest(counted, {
+        month: 11, year: 2026, rows: manyDistricts, zoneName: 'Multi District Zone',
+      }));
+      assert.ok(queries <= 24, `Expected <=24 queries, got ${queries}`);
+      assert.equal(result.masters.districtsCreated, 50);
+      assert.equal(result.contributions.total, 500);
+      assert.equal(result.districtNames.length, 50);
+      t.diagnostic(`500 employees, 50 districts: ${queries} queries`);
     });
   } finally {
     await client.query(`drop schema if exists "${schema}" cascade`);

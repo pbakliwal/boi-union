@@ -15,7 +15,7 @@ router.post(
   '/',
   requireAdmin,
   asyncHandler(async (req, res) => {
-    requireFields(req.body, ['month', 'year']);
+    requireFields(req.body, ['month', 'year', 'zoneName']);
     const month = toInt(req.body.month, 'month');
     const year = toInt(req.body.year, 'year');
     if (month < 1 || month > 12) badRequest('month must be 1-12');
@@ -45,7 +45,6 @@ router.post(
       const summary = await runIngest(client, {
         month, year, rows,
         zoneName: req.body.zoneName,
-        districtName: req.body.districtName,
       });
       if (commit) await client.query('COMMIT');
       else await client.query('ROLLBACK');

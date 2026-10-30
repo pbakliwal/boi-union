@@ -1,7 +1,7 @@
 'use strict';
 
 // CLI: ingest a salary-register file (CSV or Excel).
-//   node scripts/ingest.js <file.csv|.xlsx> [--month M --year Y] [--reset] [--dry]
+//   node scripts/ingest.js <file.csv|.xlsx> [--month M --year Y] [--zone NAME] [--reset] [--dry]
 // If --month/--year are omitted it infers them from a MONYY token in the
 // filename (e.g. UNION_APR26.csv -> April 2026).
 // --reset wipes existing masters/contributions first (fresh bootstrap).
@@ -29,8 +29,11 @@ function inferFromName(file) {
 async function main() {
   const file = process.argv[2];
   if (!file || file.startsWith('--')) {
-    console.error('Usage: node scripts/ingest.js <file.csv|.xlsx> [--month M --year Y] [--zone NAME --district NAME] [--reset] [--dry]');
+    console.error('Usage: node scripts/ingest.js <file.csv|.xlsx> [--month M --year Y] [--zone NAME] [--reset] [--dry]');
     process.exit(1);
+  }
+  if (has('--district')) {
+    throw new Error('--district is no longer supported. Supply DISTRICT in every employee row and upload a complete zone file.');
   }
   const inferred = inferFromName(file);
   const month = Number(arg('--month') || inferred.month);
@@ -56,7 +59,6 @@ async function main() {
     const summary = await runIngest(client, {
       month, year, rows,
       zoneName: arg('--zone') || 'Indore',
-      districtName: arg('--district') || arg('--zone') || 'Indore',
     });
     if (has('--dry')) {
       await client.query('ROLLBACK');
